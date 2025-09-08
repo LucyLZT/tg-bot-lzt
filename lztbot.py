@@ -1,4 +1,4 @@
-import os, re, time, json, math, asyncio, requests, logging, hashlib, html as _html
+import os, re, time, json, math, asyncio, requests, logging, hashlib, html as _html, random
 from datetime import datetime
 from typing import Dict, Any, Optional, List, Tuple
 from dotenv import load_dotenv
@@ -1092,25 +1092,46 @@ async def b_add_msg(m: Message, state: FSMContext):
     tid = parse_thread_id(parts[0]) if parts else None
     if not tid:
         await m.reply("⚠️ Дай ссылку/ID темы.", reply_markup=kb_form()); return
+
     interval = 10
     if len(parts) >= 2 and parts[1].isdigit():
         interval = max(5, int(parts[1]))
-    cfg = _load(BUMPS_FILE, {"threads":[]}); arr = cfg.get("threads", [])
+
+    cfg = _load(BUMPS_FILE, {"threads":[]})
+    arr = cfg.get("threads", [])
+
     for th in arr:
         if int(th["thread_id"]) == int(tid):
-            th["interval_min"] = interval; _save(BUMPS_FILE, cfg)
-            await m.answer(f"✅ Обновил тему #{tid}: каждые {interval} мин.", reply_markup=kb_bumps_menu()); return
+            th["interval_min"] = interval
+            now_ts = int(time.time())
+            th["next_bump_ts"] = now_ts + interval * 60
+            _save(BUMPS_FILE, cfg)
+            await m.answer(f"✅ Обновил тему #{tid}: каждые {interval} мин.", reply_markup=kb_bumps_menu())
+            return
+
     resp = thread_bump(int(tid))
-    last_ts = int(time.time()) if resp["ok"] else 0
-    arr.append({"thread_id": int(tid), "interval_min": interval, "last_bump_ts": last_ts})
-    cfg["threads"] = arr; _save(BUMPS_FILE, cfg)
-    msg = "✅ Добавил тему"
+    now_ts = int(time.time())
     if resp["ok"]:
-        msg += " и сразу поднял."
+        last_ts = now_ts
+        next_ts = now_ts + interval * 60
+        msg = "✅ Добавил тему и сразу поднял."
     else:
-        msg += f"; авто поднятие начнётся по расписанию (err {resp.get('status')})."
+        last_ts = 0
+        next_ts = now_ts + 60 
+        msg = f"✅ Добавил тему; авто начнётся по расписанию (err {resp.get('status')})."
+
+    arr.append({
+        "thread_id": int(tid),
+        "interval_min": interval,
+        "last_bump_ts": last_ts,
+        "next_bump_ts": next_ts
+    })
+    cfg["threads"] = arr
+    _save(BUMPS_FILE, cfg)
+
     await m.answer(f"{msg} #{tid}: каждые {interval} мин.", reply_markup=kb_bumps_menu())
     await state.set_state(BumpState.menu)
+
 
 @rt.callback_query(F.data == "b:del")
 async def b_del(cb: CallbackQuery, state: FSMContext):
@@ -1136,17 +1157,30 @@ async def b_del_msg(m: Message, state: FSMContext):
 async def b_bumpnow(cb: CallbackQuery):
     if not await guard(cb): return
     cfg = _load(BUMPS_FILE, {"threads":[]})
-    if not cfg.get("threads"):
+    threads = cfg.get("threads", [])
+    if not threads:
         await cb.message.answer("Пока нет тем."); await cb.answer(); return
+
     results = []
-    for th in cfg["threads"]:
-        tid = int(th["thread_id"]); resp = thread_bump(tid)
+    now_ts = int(time.time())
+
+    for th in threads:
+        tid = int(th["thread_id"])
+        resp = thread_bump(tid)
         if resp["ok"]:
-            th["last_bump_ts"] = int(time.time()); results.append(f"⏫ #{tid} — ok")
+            th["last_bump_ts"] = now_ts
+            iv = max(5, int(th.get("interval_min", 10)))
+            th["next_bump_ts"] = now_ts + iv * 60
+            results.append(f"⏫ #{tid} — ok")
         else:
             results.append(f"⏫ #{tid} — err {resp.get('status')}")
+
+    cfg["threads"] = threads
     _save(BUMPS_FILE, cfg)
-    await cb.message.answer("\n".join(results)); await cb.answer()
+
+    await cb.message.answer("\n".join(results))
+    await cb.answer()
+
 
 
 def fmt_err(title: str, resp: Dict[str, Any]) -> str:
@@ -1234,9 +1268,70 @@ async def notif_poller():
         except Exception:
             await asyncio.sleep(20)
 
+BUMP_TICK_SEC = 30          
+BUMP_JITTER_SEC = (7, 25)   
+
+async def autobump_worker():
+    await asyncio.sleep(2)
+    while True:
+        try:
+            cfg = _load(BUMPS_FILE, {"threads": []})
+            threads = cfg.get("threads", [])
+            if not isinstance(threads, list):
+                threads = []
+
+            now = int(time.time())
+            changed = False
+            results = []
+
+            for th in threads:
+                try:
+                    tid = int(th.get("thread_id"))
+                except Exception:
+                    continue
+                iv_min = max(5, int(th.get("interval_min", 10))) 
+                last_ts = int(th.get("last_bump_ts", 0))
+                next_ts = int(th.get("next_bump_ts", 0))
+
+                if next_ts <= 0:
+                    next_ts = last_ts + iv_min * 60 if last_ts else now
+
+                if now < next_ts:
+                    continue
+
+                resp = thread_bump(tid)
+                if resp.get("ok"):
+                    th["last_bump_ts"] = now
+                    jitter = random.randint(*BUMP_JITTER_SEC)
+                    th["next_bump_ts"] = now + iv_min * 60 + jitter
+                    results.append(f"#{tid}: ok")
+                else:
+                    status = int(resp.get("status", 0) or 0)
+                    backoff = min(iv_min * 60, 300) if status in (403, 429) else 60
+                    th["next_bump_ts"] = now + backoff
+                    results.append(f"#{tid}: err {status}")
+                changed = True
+
+            if changed:
+                cfg["threads"] = threads
+                _save(BUMPS_FILE, cfg)
+
+            if results:
+                try:
+                    await bot.send_message(ADMIN_USER_ID, "⏫ Автоподнятие:\n" + "\n".join(results))
+                except Exception:
+                    pass
+
+            await asyncio.sleep(BUMP_TICK_SEC)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(BUMP_TICK_SEC)
+
 
 async def main():
     asyncio.create_task(notif_poller())
+    asyncio.create_task(autobump_worker())  
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
